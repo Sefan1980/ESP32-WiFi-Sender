@@ -1,0 +1,36 @@
+<html>
+  <head>
+    <meta charset='UTF-8'>
+    <title>Settings - DIYRobotLawnMower Headquarter</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <style>
+      body { font-family: sans-serif; background-color: #e8f5e9; padding: 10px; }
+       .card { background: white; border-radius: 15px; padding: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+      input[type=text], input[type=password], input[type=range] { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 5px; }
+       .btn { display: block; padding: 10px; background: #2e7d32; color: white; text-align: center; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 15px; cursor: pointer; border: none; width: 100%; }
+       .btn-red { background: #d32f2f; margin-top: 30px; }
+       .btn-gray { background: #757575; }
+    </style>
+  </head>
+  <body>
+    <div class='card'>
+      <h1 style='text-align:center;'>⚙️ Einstellungen</h1>
+      %SAVE_NOTICE%
+      <h3 style='color:#1a3c34;'>Aktueller Ladestrom: %ChargeCurrent% mA</h3>
+      <form action='/save' method='GET'>
+        <label><b>PeriOnOffThreshold:</b> <span id='pVal'>%PeriOnOffThreshold%</span> mA</label>
+        <input type='range' name='peri' min='0' max='30' step='0.1' value='%PeriOnOffThreshold%' oninput="document.getElementById('pVal').innerText=this.value"><br><br>
+        <label><b>Sigcode 0:</b></label><input type='text' name='s0' value='%SigCode0%'><br />
+        <label><b>Sigcode 1:</b></label><input type='text' name='s1' value='%SigCode1%'><br />
+        <label><b>Sigcode 2:</b></label><input type='text' name='s2' value='%SigCode2%'><br />
+        <label><b>Sigcode 3:</b></label><input type='text' name='s3' value='%SigCode3%'><br />
+        <label><b>Sigcode 4:</b></label><input type='text' name='s4' value='%SigCode4%'><br />
+        %MQTT_SETTINGS_BLOCK%
+        %WHATSAPP_SETTINGS_BLOCK%
+        <button type='submit' class='btn'>💾 Speichern</button>
+      </form>
+      <a href='/' class='btn btn-gray'>⬅️ Zurück zum Dashboard</a>
+      <a href='/reset' class='btn btn-red' onclick="return confirm('⚠️ WIRKLICH ALLES LÖSCHEN? Der ESP startet neu und löscht alle WLAN-Daten und gespeicherten Werte!')">⚠️ Werksreset (WLAN & Config löschen)</a>
+    </div>
+  </body>
+</html>
