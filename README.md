@@ -19,6 +19,8 @@ The sender continuously transmits a signal code through a wire buried around the
 - **OTA (Over-The-Air) firmware updates** — after the initial USB upload, you can update wirelessly
 - **Automatic mode**: starts/stops the perimeter signal based on the measured charging current, with a configurable safety timeout
 - **Wire-cut detection**: alerts if the perimeter current drops unexpectedly while a sender is active
+- **Works with ESP32 Arduino core 2.x and 3.x** — a small compatibility layer automatically uses the right hardware-timer API for whichever core version you have installed
+- **Robust built-in web server**: exact route matching, request-size limit, inactivity timeout, and proper HTTP status codes (303 redirect after saving, 400/404/408/413/500 where appropriate) — no more duplicate responses or requests that leave the browser hanging
 - No hardcoded WiFi credentials — first-time setup goes through a [WiFiManager](https://github.com/tzapu/WiFiManager) captive portal
 
 ---
@@ -81,9 +83,11 @@ All pins are `#define`d near the top of the sketch, so they're easy to change if
    - `UrlEncode` (by Masayuki Sugahara)
    - `INA226_WE` (by Wolfgang Ewald)
    - `U8g2` (by oliver / olikraus) — provides `U8x8lib.h`
-   - `ArduinoOTA`, `LittleFS`, `FS`, `HTTPClient`, `WiFiClient` are part of the ESP32 core and don't need separate installation.
+   - `ArduinoOTA`, `LittleFS`, `FS`, `HTTPClient`, `WiFiClient`, `esp_arduino_version.h` are part of the ESP32 core and don't need separate installation.
 3. Install the **[arduino-littlefs-upload](https://github.com/earlephilhower/arduino-littlefs-upload)** plugin — this lets you upload `index.html`, `settings.html` and `config.json` to the ESP32's flash file system (LittleFS) directly from the IDE via `Ctrl+Shift+P`.
 4. Put `index.html`, `settings.html` and `config.json` (from the language folder you chose) into a subfolder named **`data`**, right next to your `.ino` file.
+
+> ℹ️ **ESP32 core 2.x and 3.x are both supported.** The sketch detects which core generation is installed (via `ESP_ARDUINO_VERSION_MAJOR`) and automatically uses the matching hardware-timer API — you don't need to change anything yourself.
 
 ### 2. Board settings — **important!**
 
@@ -118,7 +122,7 @@ Once connected to your WiFi, find the ESP32's IP address (check your router's de
 
 - **`/`** — Dashboard: live voltage/current readings, uptime, current signal code, sender status, and quick toggles.
 - **`/settings`** — Change the `PeriOnOffThreshold`, edit any of the 5 signal codes, and (if the corresponding feature is enabled in the sketch) configure MQTT and WhatsApp. Settings are saved to `config.json` in flash and survive a reboot.
-- **`/reset`** — Factory reset: wipes WiFi credentials and saved settings, then restarts.
+- **`/reset`** — Factory reset: sends a confirmation, then wipes WiFi credentials and saved settings and restarts.
 - **`/download-settings`** — Downloads the current `config.json`.
 
 ---
@@ -184,6 +188,7 @@ To use a language version: copy the four files from that folder into your sketch
 ## 🙏 Credits
 
 - Perimeter signal codes based on the [Ardumower](http://grauonline.de/alexwww/ardumower/filter/filter.html) project.
+- HTTP/WiFi robustness rework and ESP32 core 2.x/3.x timer compatibility layer by Fürst Ruprecht / Knappe Herbert (2026-09-16).
 - Built with: [ArduinoJson](https://arduinojson.org/), [PubSubClient](https://github.com/knolleary/pubsubclient), [WiFiManager](https://github.com/tzapu/WiFiManager), [UrlEncode](https://github.com/plageoj/urlencode), [INA226_WE](https://github.com/wollewald/INA226_WE), [U8g2](https://github.com/olikraus/u8g2), and the ESP32 Arduino core.
 
 ---

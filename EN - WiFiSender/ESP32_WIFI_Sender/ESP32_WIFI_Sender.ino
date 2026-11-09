@@ -40,7 +40,7 @@
 // ============================================================================
 //
 // ============================================================================
-//  DIYRobotLawnMower Headquarter 1.0 - 07.05.26
+//  DIYRobotLawnMower Headquarter
 //  This program runs on an ESP32 and drives the "perimeter wire sender" of a
 //  DIY robotic lawn mower. It sends a repeating electrical signal code through
 //  a wire buried around the lawn; the mower's own sensor uses that signal to
@@ -66,14 +66,6 @@
 //  (LittleFS is a tiny file system that lives inside the ESP32's flash memory.
 //   The web pages (index.html, settings.html) and the saved settings
 //   (config.json) are stored there - NOT in this .ino file.)
-//
-// Developer notes (kept from the original author):
-// - MQTT works, but wasn't very stable at first (too many requests). The
-//   client.flush() call around line ~1200 was disabled, which seems to help.
-// - Solved: WhatsApp used to cause an HTTP 429 error ("Too Many Requests"),
-//   and the log looked garbled ("...successfullyError sending the message").
-//   That was simply a missing line break in a Serial.print() call, now fixed.
-// - TODO: a freely adjustable sending frequency is not implemented yet.
 
 
 //********************* Includes **********************************
@@ -83,6 +75,7 @@
 #define CONFIG_LITTLEFS_FOR_IDF_3_2
 #include <LittleFS.h>                  // Small file system inside the flash memory (stores web pages + settings)
 #include <FS.h>                        // Generic file system support, needed by LittleFS
+#include <esp_arduino_version.h>       // Provides ESP_ARDUINO_VERSION_MAJOR (used to tell ESP32 core 2.x / 3.x apart)
 #include <ArduinoJson.h>               // Reads and writes JSON text (used for config.json) - library by Benoit
 #include "soc/gpio_struct.h"           // Gives direct, low-level access to the GPIO pins so the interrupt (ISR) can run as fast as possible
 #include "freertos/FreeRTOS.h"         // The ESP32's built-in mini "operating system" that can run several tasks at once
@@ -504,8 +497,137 @@ String extractParam(String request, String paramName) {
   start += searchStr.length();
   int end = request.indexOf("&", start);
   if (end == -1) end = request.indexOf(" ", start);
-  if (end == -1) return "";
+  if (end == -1) end = request.length();
   return urlDecode(request.substring(start, end));
+}
+
+
+// --- HTTP helper functions ---------------------------------------------------
+// These functions make sure every browser request gets exactly ONE clean HTTP
+// response. Headers are only sent once the route has been clearly identified.
+// That avoids duplicate headers/responses and clients that hang waiting.
+
+// Pulls just the requested path out of the whole (multi-line) HTTP request.
+// A typical request line looks like:
+//   "GET /save?peri=1.5 HTTP/1.1"
+// This function cuts out just "/save?peri=1.5" - i.e. everything between the
+// "GET " at the start and the next space (before "HTTP/1.1"). If the request
+// is not a GET request or malformed, an empty string "" is returned - that's
+// checked further down.
+String getRequestPath(const String &request) {
+  int lineEnd = request.indexOf('\n');                  // Find the end of the first line
+  String firstLine = (lineEnd >= 0) ? request.substring(0, lineEnd) : request;
+  firstLine.trim();                                      // Strip leading/trailing spaces and \r
+
+  if (!firstLine.startsWith("GET ")) return "";          // Not a GET request -> empty path = "unknown/invalid"
+
+  int pathStart = 4;                                      // "GET " is exactly 4 characters long, the path starts right after
+  int pathEnd = firstLine.indexOf(' ', pathStart);        // Next space = end of the path (before it comes e.g. "HTTP/1.1")
+  if (pathEnd < 0) return "";                             // No second space found -> the request is malformed
+
+  return firstLine.substring(pathStart, pathEnd);
+}
+
+// Sends the HTTP response header lines. Every HTTP response starts with this:
+// the status (e.g. "200 OK" or "404 Not Found"), the content type (e.g.
+// "text/html"), the length of the content in bytes (Content-Length - so the
+// client knows how much to expect), and the info that the connection will be
+// closed afterward. A blank line marks the end of the header - the actual
+// content (body) follows after that.
+void sendHttpHeader(WiFiClient &client, const char* status, const char* contentType, size_t contentLength) {
+  client.print("HTTP/1.1 ");
+  client.println(status);
+  client.print("Content-Type: ");
+  client.println(contentType);
+  client.print("Content-Length: ");
+  client.println(contentLength);
+  client.println("Connection: close");
+  client.println();
+}
+
+// Sends a plain-text response (e.g. for error messages like 404 or 400).
+// Uses sendHttpHeader() for the header and then just appends the text directly.
+void sendHttpText(WiFiClient &client, const char* status, const String &text) {
+  sendHttpHeader(client, status, "text/plain; charset=utf-8", text.length());
+  client.print(text);
+}
+
+// Sends the browser a "real" HTTP redirect to another address (status code
+// 303 "See Other"). This is the technically correct way to redirect to
+// another page after an action (here: after saving the settings) - the
+// browser reacts immediately to the "Location:" header, without first having
+// to load and parse a small HTML page with a meta-refresh tag.
+void sendHttpRedirect(WiFiClient &client, const String &location) {
+  String body = "Redirecting...";                        // Short text, in case the browser doesn't show the redirect itself
+  client.println("HTTP/1.1 303 See Other");
+  client.print("Location: ");                             // Tells the browser where to go next
+  client.println(location);
+  client.println("Content-Type: text/plain; charset=utf-8");
+  client.print("Content-Length: ");
+  client.println(body.length());
+  client.println("Connection: close");
+  client.println();
+  client.print(body);
+}
+
+// Reads an HTML file (index.html or settings.html) from LittleFS, replaces
+// the %placeholders% in it with real values (see processor()), and sends the
+// result as a complete HTTP response to the browser.
+// Two error cases are handled cleanly here: the file doesn't exist at all
+// (404), or it does exist according to LittleFS.exists() but can't be opened
+// for some reason (500) - this can happen e.g. if the file system is corrupted.
+void sendProcessedHtmlFile(WiFiClient &client, const char* filename, bool justSaved = false) {
+  if (!LittleFS.exists(filename)) {
+    sendHttpText(client, "404 Not Found", "404 - File not found");
+    return;
+  }
+
+  File file = LittleFS.open(filename, "r");
+  if (!file) {
+    sendHttpText(client, "500 Internal Server Error", "Could not open file");
+    return;
+  }
+
+  String html = file.readString();                       // Read the whole file into memory at once
+  file.close();
+  String body = processor(html, justSaved);               // Replace the %placeholders% with real values
+
+  sendHttpHeader(client, "200 OK", "text/html; charset=utf-8", body.length());
+  client.print(body);
+}
+
+// Sends the current config.json as a file download (not to display in the
+// browser, but to save - that's what the "Content-Disposition: attachment"
+// header does). The file is not read and sent byte by byte (that would be
+// noticeably slow on the ESP32), but in 512-byte chunks - much more
+// efficient for larger files.
+void sendConfigDownload(WiFiClient &client) {
+  if (!LittleFS.exists("/config.json")) {
+    sendHttpText(client, "404 Not Found", "File not found.");
+    return;
+  }
+
+  File file = LittleFS.open("/config.json", "r");
+  if (!file) {
+    sendHttpText(client, "500 Internal Server Error", "Could not open config.json.");
+    return;
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/octet-stream");
+  client.println("Content-Disposition: attachment; filename=\"config.json\"");
+  client.print("Content-Length: ");
+  client.println(file.size());
+  client.println("Connection: close");
+  client.println();
+
+  uint8_t buffer[512];                                    // 512-byte read buffer instead of single bytes - saves many individual, slow read/write operations
+  while (file.available()) {
+    size_t bytesRead = file.read(buffer, sizeof(buffer));
+    if (bytesRead == 0) break;
+    client.write(buffer, bytesRead);
+  }
+  file.close();
 }
 
 
@@ -682,6 +804,37 @@ void IRAM_ATTR onTimer() {
   portEXIT_CRITICAL_ISR(&timerMux);                     // Allow other interrupts again
 }
 // End of signal management
+
+
+//********************* ESP32 TIMER COMPATIBILITY ************************
+// Arduino-ESP32 core 2.x and 3.x use different hardware timer APIs. These
+// two helper functions wrap the difference, so the same sketch compiles
+// against both core generations.
+void setupSignalTimer() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // ESP32 Arduino core 3.x: timerBegin() takes the desired frequency directly.
+  timer = timerBegin(1000000);
+  timerAttachInterrupt(timer, &onTimer);
+  timerAlarm(timer, sigDuration, true, 0);
+#else
+  // ESP32 Arduino core 2.x: timer 0, prescaler 80 at 80 MHz -> 1 MHz = 1 us per tick.
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &onTimer, true);
+  timerAlarmWrite(timer, sigDuration, true);
+  timerAlarmEnable(timer);
+#endif
+}
+
+void setSignalTimerDuration(uint32_t duration) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  // ESP32 Arduino core 3.x
+  timerAlarm(timer, duration, true, 0);
+#else
+  // ESP32 Arduino core 2.x
+  timerAlarmWrite(timer, duration, true);
+#endif
+}
+// End of ESP32 timer compatibility
 
 
 //********************* CHANGE AREA **********************************
@@ -865,10 +1018,10 @@ void MQTTinput(char* topic, byte* payload, unsigned int length) {
       digitalWrite(pinIN4, LOW);
     } else if (messageTemp == "sigDuration50") {
       sigDuration = 50;
-      timerAlarm(timer, 50, true, 0);
+      setSignalTimerDuration(sigDuration);
     } else if (messageTemp == "sigDuration104") {
       sigDuration = 104;
-      timerAlarm(timer, 104, true, 0);
+      setSignalTimerDuration(sigDuration);
     } else if (messageTemp == "sigCode0") {
       sigCodeInUse = 0;
       changeArea(sigCodeInUse);
@@ -894,23 +1047,20 @@ void MQTTinput(char* topic, byte* payload, unsigned int length) {
 
 
 //********************* Keep WiFi Alive **********************************
-// Checks, every "wifiCheckInterval" milliseconds, whether the WiFi connection
-// is still alive - and if not, tries to quietly reconnect in the background
-// without blocking the rest of the program (loop() keeps running normally).
+// The ESP32 itself handles reconnecting, via WiFi.setAutoReconnect(true).
+// This function only monitors and logs the status. Important: NO extra
+// WiFi.begin()/WiFi.reconnect() call while an automatic reconnect might
+// already be in progress - competing connect attempts can destabilize the
+// WiFi stack.
 void keepWiFiAlive() {
   unsigned long currentMillis = millis();
 
-  // Only actually check once the defined interval has passed
   if (currentMillis - lastWiFiCheckMillis >= wifiCheckInterval) {
     lastWiFiCheckMillis = currentMillis;
 
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Connection lost! Trying to reconnect in the background...");
-
-      // Since WiFiManager already stored the WiFi credentials in the ESP32's
-      // flash memory, a plain, non-blocking call to begin() is enough here:
-      WiFi.begin(); 
-    } else {
+      Serial.println("[WiFi] Connection lost - auto-reconnect is active.");
+    } else if (debug) {
       Serial.print("[WiFi] Connected. IP: ");
       Serial.println(WiFi.localIP());
     }
@@ -950,9 +1100,7 @@ void setup() {
   u8x8.setFont(u8x8_font_5x8_f);                  // Choose a small, readable font
   u8x8.clear();
   #endif
-  timer = timerBegin(1000000);                    // Start a hardware timer that ticks 1,000,000 times per second (1 tick = 1 microsecond)
-  timerAttachInterrupt(timer, &onTimer);           // Tell the timer to call onTimer() automatically on every alarm
-  timerAlarm(timer, sigDuration, true, 0);         // Set the alarm to trigger every "sigDuration" microseconds, and repeat forever
+  setupSignalTimer();                              // Initialize the hardware timer matching the installed ESP32 core 2.x or 3.x
   pinMode(pinIN1, OUTPUT);                        // Configure all the driver control pins as digital OUTPUTs
   pinMode(pinIN2, OUTPUT);
   pinMode(pinEnableA, OUTPUT);
@@ -1427,240 +1575,225 @@ void loop() {
   WiFiClient client = server.available(); // Check if someone opened the IP in a browser
   if (client) {
     unsigned long currentTime = millis();
-    unsigned long previousTime = currentTime;
-    unsigned long timeoutTime = 500;  // Max time to wait for data
-    String req; // Stores the request string
-    String currentLine;
+    unsigned long previousTime = currentTime;               // Time of the last byte received (see timeoutTime below)
+    const unsigned long timeoutTime = 500;  // Inactivity timeout in milliseconds: expires if NOTHING at all arrives from the client for 500ms (not counted from the start of the connection!) - so slow connections aren't cut off unnecessarily
+    String req;                                              // Collects the whole HTTP request read so far (all header lines)
+    String currentLine;                                      // The single line currently being read - cleared after every line break
+    bool requestHandled = false;                             // Remembers whether we've already sent the client a response (for the 408 error handling further down)
 
     // While the client is connected and hasn't timed out
     while (client.connected() && currentTime - previousTime <= timeoutTime) {
       currentTime = millis();
-      if (client.available()) {             // if there are bytes to read from the client,
-        char c = client.read();             // read a byte, then
-        //Serial.write(c);                  // print it out the serial monitor
-        req += c;                           // and add it to our request string
-        if (c == '\n') {                    // if the byte is a newline character
-          // if the current line is blank, you got two newline characters in a row.
-          // that's the end of the client HTTP request, so send a response:
+
+      if (client.available()) {
+        char c = client.read();
+        previousTime = currentTime;          // Timeout counts from the last byte received
+        req += c;
+
+        // Protection against unusually large/malformed HTTP requests: more
+        // than 4096 characters should never happen for a normal request to
+        // this small web server - without this limit, "req" could grow
+        // without bound on a broken or malicious request and exhaust the
+        // ESP32's limited memory.
+        if (req.length() > 4096) {
+          sendHttpText(client, "413 Payload Too Large", "HTTP request too large");
+          requestHandled = true;
+          break;
+        }
+
+        if (c == '\n') {
+          // Blank line = end of the HTTP headers, now evaluate the route
           if (currentLine.length() == 0) {
-            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
-            // and a content-type so the client knows what's coming, then a blank line:
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-Type: text/html; charset=utf-8"); // Important!
-            client.println("Connection: close");
-            client.println(); // Blank line marks the end of the header
+            String path = getRequestPath(req);
 
-            // Keeps track of whether one of the following cases (e.g. /save or
-            // /download-settings) already sent its own, complete response.
-            // Without this flag, index.html/settings.html would ALWAYS get
-            // appended at the very end as well - which, e.g. after saving,
-            // resulted in two complete HTML pages in one response, which the
-            // browser can't render cleanly (blank/white page)!
-            bool responseAlreadySent = false;
+            // This small web server only supports GET
+            if (path == "") {
+              sendHttpText(client, "400 Bad Request", "Invalid HTTP request");
+              requestHandled = true;
+            }
 
-            // Evaluate which page/action was requested
-            if (req.indexOf("GET /toggleA") != -1) {
-              // Logic to toggle sender A on/off
-              if (enableSenderA){
+            // Toggle sender A
+            else if (path == "/toggleA") {
+              if (enableSenderA) {
                 enableSenderA = false;
                 workTimeMins = 0;
                 digitalWrite(pinEnableA, LOW);
                 digitalWrite(pinIN1, LOW);
-                digitalWrite(pinIN2, LOW); 
-              }
-              else if(!enableSenderA){
+                digitalWrite(pinIN2, LOW);
+              } else {
                 enableSenderA = true;
                 workTimeMins = 0;
                 digitalWrite(pinEnableA, HIGH);
                 digitalWrite(pinIN1, LOW);
                 digitalWrite(pinIN2, LOW);
               }
-
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
             }
 
-            else if (req.indexOf("GET /toggleB") != -1) {
-              // Logic to toggle sender B on/off
-              if (enableSenderB){
+            // Toggle sender B
+            else if (path == "/toggleB") {
+              if (enableSenderB) {
                 enableSenderB = false;
                 workTimeMins = 0;
                 digitalWrite(pinEnableB, LOW);
                 digitalWrite(pinIN1, LOW);
-                digitalWrite(pinIN2, LOW); 
-              }
-              else if(!enableSenderB){
+                digitalWrite(pinIN2, LOW);
+              } else {
                 enableSenderB = true;
                 workTimeMins = 0;
                 digitalWrite(pinEnableB, HIGH);
                 digitalWrite(pinIN1, LOW);
                 digitalWrite(pinIN2, LOW);
               }
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
             }
 
-            else if (req.indexOf("GET /toggleauto") != -1) {
-              if(AUTO_START_SIGNAL == 1){
-                AUTO_START_SIGNAL = 0;
-              } else {
-                AUTO_START_SIGNAL = 1;
-              }
+            // Toggle auto mode
+            else if (path == "/toggleauto") {
+              AUTO_START_SIGNAL = (AUTO_START_SIGNAL == 1) ? 0 : 1;
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
             }
 
-            else if (req.indexOf("GET /changeSig") != -1) {
+            // Advance the signal code. /changeSig stays as an alias for older links.
+            else if (path == "/changeSignalCode" || path == "/changeSig") {
               sigCodeInUse++;
               if (sigCodeInUse > 4) sigCodeInUse = 0;
-              saveSettingsToLittleFS(); // Save the settings!
+              saveSettingsToLittleFS();
               changeArea(sigCodeInUse);
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
             }
 
-            else if (req.indexOf("GET /reset ") != -1) {
+            // Factory reset: finish the response cleanly first, then trigger the restart
+            else if (path == "/reset") {
+              sendHttpText(client, "200 OK", "Factory reset is running. The ESP32 will restart.");
+              client.stop();
+              delay(50);
               factoryReset();
+              requestHandled = true;
             }
-            
-            else if (req.indexOf("GET /save?") != -1) {
-              // Read the values submitted through the settings form
-              String pVal = extractParam(req, "peri");
-              if (pVal != "") PeriOnOffThreshold = pVal.toFloat();
-              
-              String s0 = extractParam(req, "s0"); if (s0 != "") parseSigcode(s0, sigcode0, sigcode0_size);
-              String s1 = extractParam(req, "s1"); if (s1 != "") parseSigcode(s1, sigcode1, sigcode1_size);
-              String s2 = extractParam(req, "s2"); if (s2 != "") parseSigcode(s2, sigcode2, sigcode2_size);
-              String s3 = extractParam(req, "s3"); if (s3 != "") parseSigcode(s3, sigcode3, sigcode3_size);
-              String s4 = extractParam(req, "s4"); if (s4 != "") parseSigcode(s4, sigcode4, sigcode4_size);
 
-              // --- Apply MQTT settings (only if MQTT is enabled) ---
+            // Save settings
+            else if (path.startsWith("/save?")) {
+              String pVal = extractParam(path, "peri");
+              if (pVal != "") PeriOnOffThreshold = pVal.toFloat();
+
+              String s0 = extractParam(path, "s0"); if (s0 != "") parseSigcode(s0, sigcode0, sigcode0_size);
+              String s1 = extractParam(path, "s1"); if (s1 != "") parseSigcode(s1, sigcode1, sigcode1_size);
+              String s2 = extractParam(path, "s2"); if (s2 != "") parseSigcode(s2, sigcode2, sigcode2_size);
+              String s3 = extractParam(path, "s3"); if (s3 != "") parseSigcode(s3, sigcode3, sigcode3_size);
+              String s4 = extractParam(path, "s4"); if (s4 != "") parseSigcode(s4, sigcode4, sigcode4_size);
+
               #ifdef MQTT
                 bool mqttSettingsChanged = false;
-                String newMqttServer = extractParam(req, "mqttServer");
+                String newMqttServer = extractParam(path, "mqttServer");
                 if (newMqttServer != "" && newMqttServer != mqtt_server) { mqtt_server = newMqttServer; mqttSettingsChanged = true; }
 
-                String newMqttPortStr = extractParam(req, "mqttPort");
+                String newMqttPortStr = extractParam(path, "mqttPort");
                 if (newMqttPortStr != "") {
                   int newMqttPort = newMqttPortStr.toInt();
                   if (newMqttPort > 0 && newMqttPort != mqtt_port) { mqtt_port = newMqttPort; mqttSettingsChanged = true; }
                 }
 
-                String newClientID = extractParam(req, "mqttClientID");
+                String newClientID = extractParam(path, "mqttClientID");
                 if (newClientID != "") clientID = newClientID;
 
-                String newMqttUser = extractParam(req, "mqttUser");
+                String newMqttUser = extractParam(path, "mqttUser");
                 if (newMqttUser != "" && newMqttUser != MQTT_user) { MQTT_user = newMqttUser; mqttSettingsChanged = true; }
 
-                String newMqttPassword = extractParam(req, "mqttPassword");
+                String newMqttPassword = extractParam(path, "mqttPassword");
                 if (newMqttPassword != "" && newMqttPassword != MQTT_password) { MQTT_password = newMqttPassword; mqttSettingsChanged = true; }
 
-                String newSubTopic = extractParam(req, "mqttSubTopic");
-                if (newSubTopic != "" && newSubTopic != subTopic) {
-                  subTopic = newSubTopic;
-                  // If the subscribe topic changed, it needs to be
-                  // re-subscribed on the next connection - that happens
-                  // automatically in loop() as soon as MQTTclient.connected()
-                  // returns false the next time.
-                  mqttSettingsChanged = true;
-                }
+                String newSubTopic = extractParam(path, "mqttSubTopic");
+                if (newSubTopic != "" && newSubTopic != subTopic) { subTopic = newSubTopic; mqttSettingsChanged = true; }
 
-                String newPubTopic = extractParam(req, "mqttPubTopic");
+                String newPubTopic = extractParam(path, "mqttPubTopic");
                 if (newPubTopic != "") pubTopic = newPubTopic;
 
-                String newPubTopic2 = extractParam(req, "mqttPubTopic2");
+                String newPubTopic2 = extractParam(path, "mqttPubTopic2");
                 if (newPubTopic2 != "") pubTopic2 = newPubTopic2;
 
-                String newPubTopic3 = extractParam(req, "mqttPubTopic3");
+                String newPubTopic3 = extractParam(path, "mqttPubTopic3");
                 if (newPubTopic3 != "") pubTopic3 = newPubTopic3;
 
-                // If server/port/credentials/topic changed, disconnect the
-                // existing connection - loop() will then automatically
-                // reconnect with the new values and re-subscribe to the
-                // (possibly new) subTopic.
                 if (mqttSettingsChanged) {
                   MQTTclient.disconnect();
                   MQTTclient.setServer(mqtt_server.c_str(), mqtt_port);
                 }
               #endif
 
-              // --- Apply WhatsApp settings (only if WhatsApp is enabled) ---
               #ifdef WhatsApp_messages
-                String newWaPhone = extractParam(req, "waPhone");
+                String newWaPhone = extractParam(path, "waPhone");
                 if (newWaPhone != "") mobile_number = newWaPhone;
 
-                String newWaApiKey = extractParam(req, "waApiKey");
+                String newWaApiKey = extractParam(path, "waApiKey");
                 if (newWaApiKey != "") api_key = newWaApiKey;
               #endif
 
               saveSettingsToLittleFS();
-              changeArea(sigCodeInUse); // Immediately apply the current code with the new values
-              
-              // Redirect the browser back to the settings page - with
-              // "?saved=1" in the URL, so the settings page knows it should
-              // show the "Settings saved!" confirmation notice.
-              client.println("<html><head><meta http-equiv='refresh' content='0; url=/settings?saved=1'></head><body>Saving...</body></html>");
-              responseAlreadySent = true;   // Prevents index.html from also being appended at the end
+              changeArea(sigCodeInUse);
+
+              // A real HTTP redirect instead of a second/extra HTML response
+              sendHttpRedirect(client, "/settings?saved=1");
+              requestHandled = true;
             }
-            
-            else if (req.indexOf("GET /changeSpeed") != -1) {
+
+            // Toggle signal speed
+            else if (path == "/changeSpeed") {
               if (sigDuration == 104) {
                 sigDuration = 50;
-                timerAlarm(timer, sigDuration, true, 0);
               } else {
                 sigDuration = 104;
-                timerAlarm(timer, sigDuration, true, 0);
               }
+              setSignalTimerDuration(sigDuration);
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
             }
 
-            else if (req.indexOf("GET /download-settings") != -1) {
-              if (LittleFS.exists("/config.json")) {
-                File file = LittleFS.open("/config.json", "r");
-                client.println("HTTP/1.1 200 OK");
-                client.println("Content-Type: application/octet-stream"); // Forces a file download instead of showing it
-                client.println("Content-Disposition: attachment; filename=\"config.json\"");
-                client.println("Connection: close");
-                client.println();
-        
-                while (file.available()) {
-                  client.write(file.read());
-                }
-                file.close();
-              } else {
-                client.println("HTTP/1.1 404 Not Found\n\nFile not found.");
-              }
-              responseAlreadySent = true;   // Prevents index.html from also being appended at the end
+            // Download config.json - exactly ONE dedicated HTTP header
+            else if (path == "/download-settings") {
+              sendConfigDownload(client);
+              requestHandled = true;
             }
 
-            // READ AND SEND THE REQUESTED HTML FILE
-            // Only run this if no response was already sent above (e.g. by
-            // /save or /download-settings) - see responseAlreadySent further up.
-            if (!responseAlreadySent) {
-            String filename = "/index.html";
-            if (req.indexOf("GET /settings") != -1) filename = "/settings.html";
-
-            // Was this the redirect after saving (URL contains "saved=1"),
-            // the confirmation notice is shown on the settings page.
-            bool justSaved = (req.indexOf("saved=1") != -1);
-
-            if (LittleFS.exists(filename)) {
-              File file = LittleFS.open(filename, "r");
-              String html = file.readString();
-              file.close();
-              client.print(processor(html, justSaved)); // This is where the %placeholders% get replaced with real values!
-            } else {
-              client.println("File not found!");
+            // Settings page
+            else if (path == "/settings" || path.startsWith("/settings?")) {
+              bool justSaved = (path.indexOf("saved=1") != -1);
+              sendProcessedHtmlFile(client, "/settings.html", justSaved);
+              requestHandled = true;
             }
-            }   // END if (!responseAlreadySent)
-            break;   // This request is fully handled - the connection is about to close (regardless of which case above applied)
+
+            // Dashboard
+            else if (path == "/") {
+              sendProcessedHtmlFile(client, "/index.html");
+              requestHandled = true;
+            }
+
+            // Anything else gets a clean 404
+            else {
+              sendHttpText(client, "404 Not Found", "404 - Not Found");
+              requestHandled = true;
+            }
+
+            break;
           } else {
-            // The line was NOT blank - so it's a normal header line
-            // (e.g. "Host: ..." or "User-Agent: ..."). Reset for the next
-            // line, so that currentLine.length()==0 really only matches the
-            // actual blank line (end of all headers).
             currentLine = "";
           }
         } else if (c != '\r') {
-          // A normal character (not a newline, not a carriage return) -
-          // append it to the line currently being read.
           currentLine += c;
         }
       }
-      // Clear the buffer and close connection
-      //client.flush();
     }
-  }  
+
+    // Close the TCP connection safely even on timeout/a malformed request.
+    // No client.flush(): that already caused problems in an earlier version.
+    if (!requestHandled && client.connected()) {
+      sendHttpText(client, "408 Request Timeout", "HTTP Request Timeout");
+    }
+    client.stop();
+  }
 }
 //END LOOP
